@@ -1,9 +1,8 @@
 export default async function handler(req, res) {
-  // CORS headers
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
@@ -18,7 +17,6 @@ export default async function handler(req, res) {
     const modelId = (model === 'prebuilt-read' || model === 'prebuilt-layout') ? model : 'prebuilt-layout';
     const outFmt = (format === 'text') ? 'text' : 'markdown';
 
-    // Step 1: Start document analysis
     const sourceBody = fileUrl
       ? { urlSource: String(fileUrl) }
       : { base64Source: String(base64 || '').replace(/^data:.*;base64,/, '').replace(/\s+/g, '') };
@@ -26,9 +24,10 @@ export default async function handler(req, res) {
     const qs = new URLSearchParams({ 'api-version': '2024-11-30', outputContentFormat: outFmt });
     if (pages) qs.set('pages', String(pages));
 
-    const azureUrl = `${endpoint}/documentintelligence/documentModels/${modelId}:analyze?${qs.toString()}`;
+    const analyzeUrl = `${endpoint}/documentintelligence/documentModels/${modelId}:analyze?${qs.toString()}`;
 
-    const analyzeResponse = await fetch(azureUrl, {
+    // 1) Start analysis
+    const start = await fetch(analyzeUrl, {
       method: 'POST',
       headers: {
         'Ocp-Apim-Subscription-Key': key,
@@ -37,97 +36,62 @@ export default async function handler(req, res) {
       body: JSON.stringify(sourceBody)
     });
 
-    const analyzeText = await analyzeResponse.text();
-    if (analyzeResponse.status !== 202) {
-      let details; 
-      try { details = JSON.parse(analyzeText); } catch { details = { message: analyzeText }; }
-      return res.status(analyzeResponse.status).json({ error: 'analyze_failed', details });
+    const startBodyText = await start.text();
+    if (start.status !== 202) {
+      let details; try { details = JSON.parse(startBodyText); } catch { details = { message: startBodyText }; }
+      return res.status(start.status).json({ error: 'analyze_failed', details });
     }
 
-    // Extract operation ID
-    const opLoc = analyzeResponse.headers.get('operation-location');
+    // ✅ Use Operation-Location AS-IS (no regex, no rebuilding)
+    const opLoc = start.headers.get('operation-location');
     if (!opLoc) return res.status(502).json({ error: 'missing_operation_location' });
 
-    const m = opLoc.match(/analyzeResults\/([^?]+)/);
-    const operationId = m ? m[1] : opLoc;
+    // 2) Poll Operation-Location directly
+    const maxAttempts = 30; // ~1 min @ 2s
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 2000));
 
-    // Step 2: Poll for results until completion
-    const resultUrl = `${endpoint}/documentintelligence/analyzeResults/${encodeURIComponent(operationId)}?api-version=2024-11-30`;
-    const maxAttempts = 30; // 30 attempts * 2 seconds = 1 minute max
-    let attempts = 0;
+      const poll = await fetch(opLoc, { headers: { 'Ocp-Apim-Subscription-Key': key } });
+      const pollText = await poll.text();
+      let data; try { data = JSON.parse(pollText); } catch { data = { raw: pollText }; }
 
-    while (attempts < maxAttempts) {
-      // Wait before polling (except first attempt)
-      if (attempts > 0) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-
-      const resultResponse = await fetch(resultUrl, { 
-        headers: { 'Ocp-Apim-Subscription-Key': key } 
-      });
-      
-      const resultText = await resultResponse.text();
-      let resultData;
-      
-      try { 
-        resultData = JSON.parse(resultText); 
-      } catch { 
-        resultData = { raw: resultText }; 
-      }
-
-      // If the operation is not found, return error
-      if (resultResponse.status === 404) {
-        return res.status(404).json({ 
-          error: 'operation_not_found', 
-          operationId,
-          message: 'The analysis operation was not found or has expired' 
+      // Sometimes first hit can be 404 if the op hasn't propagated — keep polling a few times
+      if (poll.status === 404 && attempt < 2) continue;
+      if (poll.status === 404) {
+        return res.status(404).json({
+          error: 'operation_not_found',
+          operationLocation: opLoc,
+          message: 'The analysis operation was not found or has expired'
         });
       }
-
-      // If there's an error in the result, return it
-      if (resultResponse.status !== 200) {
-        return res.status(resultResponse.status).json({ 
-          error: 'result_fetch_failed', 
-          details: resultData 
-        });
+      if (poll.status !== 200) {
+        return res.status(poll.status).json({ error: 'result_fetch_failed', details: data });
       }
 
-      // Check the status
-      const status = resultData.status;
-
+      const status = data.status;
       if (status === 'succeeded') {
-        // Success! Return the complete result
         return res.status(200).json({
           success: true,
-          operationId,
+          operationLocation: opLoc,
           model: modelId,
           format: outFmt,
-          status: 'succeeded',
-          result: resultData,
-          content: resultData.analyzeResult?.content || null,
-          pages: resultData.analyzeResult?.pages || null
-        });
-      } else if (status === 'failed' || status === 'canceled') {
-        // Failed or canceled
-        return res.status(400).json({
-          success: false,
-          operationId,
           status,
-          error: 'analysis_failed',
-          details: resultData
+          result: data,
+          content: data.analyzeResult?.content ?? null,
+          pages: data.analyzeResult?.pages ?? null
         });
       }
-
-      // Still running, continue polling
-      attempts++;
+      if (status === 'failed' || status === 'canceled') {
+        return res.status(400).json({ success: false, status, error: 'analysis_failed', details: data });
+      }
+      // else: notStarted/running -> loop
     }
 
-    // Timeout - operation took too long
+    // timeout
     return res.status(408).json({
       error: 'analysis_timeout',
-      operationId,
-      message: 'Document analysis is taking longer than expected. You can check the status manually.',
-      checkUrl: `/api/getContent?id=${operationId}`
+      operationLocation: opLoc,
+      message: 'Document analysis is taking longer than expected. Try polling again.'
     });
 
   } catch (e) {
